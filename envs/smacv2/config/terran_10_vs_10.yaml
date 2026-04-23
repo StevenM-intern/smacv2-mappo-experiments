@@ -35,9 +35,9 @@ capability_config:
       - "marauder"
       - "medivac"
     weights:
-      - 0.45
-      - 0.45
-      - 0.1
+      - 0.40
+      - 0.40
+      - 0.20
     exception_unit_types:
       - "medivac"
     observe: True
