@@ -32,6 +32,12 @@ medivac_5v5_10M.bat
 ```
 
 ---
+## Notes
+
+* Ensure your conda environment name matches the one in the script (`marl-ppo-suite`), or update the script accordingly.
+* SMACv2 and StarCraft II must be installed correctly before running experiments.
+* If running on a different machine, verify environment dependencies using `requirements.txt`.
+
 
 ## Experiments
 
