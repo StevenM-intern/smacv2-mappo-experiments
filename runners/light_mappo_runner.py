@@ -3,6 +3,7 @@ import time
 import numpy as np
 import torch
 import wandb
+import shutil
 
 from buffers.light_rollout_storage import RolloutStorage
 from envs import create_env
@@ -43,18 +44,17 @@ class LightMAPPORunner:
             self.reward_norm = EMANormalizer() if args.reward_norm_type == "ema" else EfficientStandardNormalizer()
 
         self.total_steps = 0
-
         self.episode_rewards = 0
         self.episode_length = 0
         self.episodes = 0
 
-    # ===========================
-    # CHECKPOINTING
-    # ===========================
+    def clean_sc2_temp(self):
+        temp_path = os.path.expanduser(r"~\AppData\Local\Temp\StarCraft II")
+        if os.path.exists(temp_path):
+            shutil.rmtree(temp_path, ignore_errors=True)
 
     def save_checkpoint(self):
         os.makedirs("checkpoints", exist_ok=True)
-
         path = f"checkpoints/{self.args.map_name}_seed{self.args.seed}.pt"
 
         torch.save({
@@ -82,10 +82,6 @@ class LightMAPPORunner:
 
             print(f"🔁 Loaded checkpoint @ {self.total_steps}")
 
-    # ===========================
-    # SAFE RESET
-    # ===========================
-
     def safe_reset_env(self, is_eval=False):
         try:
             if is_eval:
@@ -93,7 +89,9 @@ class LightMAPPORunner:
             else:
                 self.env.reset()
         except Exception as e:
-            print("⚠️ HARD RESET:", e)
+            print("⚠️ RESET FAILED → cleaning temp + restarting:", e)
+
+            self.clean_sc2_temp()
 
             try:
                 if is_eval:
@@ -112,10 +110,6 @@ class LightMAPPORunner:
                 self.env = create_env(self.args, is_eval=False)
                 self.env.reset()
 
-    # ===========================
-    # MAIN LOOP
-    # ===========================
-
     def run(self):
 
         self.load_checkpoint()
@@ -127,7 +121,6 @@ class LightMAPPORunner:
         while self.total_steps < self.args.max_steps:
 
             try:
-                # ✅ EVALUATION LOOP
                 if self.total_steps // self.args.eval_interval > evaluate_num:
                     self.evaluate(self.args.eval_episodes)
                     evaluate_num += 1
@@ -147,6 +140,7 @@ class LightMAPPORunner:
 
                 if self.total_steps % 2000000 < steps:
                     print("🔄 FULL ENV RESTART")
+                    self.clean_sc2_temp()
                     self.env.close()
                     self.evaluate_env.close()
                     time.sleep(3)
@@ -161,6 +155,7 @@ class LightMAPPORunner:
 
                 if crash_count > 5:
                     print("❌ TOO MANY CRASHES → FULL RESET")
+                    self.clean_sc2_temp()
                     self.env.close()
                     self.evaluate_env.close()
                     time.sleep(5)
@@ -170,20 +165,12 @@ class LightMAPPORunner:
 
                 self.load_checkpoint()
 
-    # ===========================
-    # WARMUP
-    # ===========================
-
     def warmup(self):
         self.safe_reset_env()
 
         self.buffer.obs[0] = np.array(self.env.get_obs(), dtype=np.float32)
         self.buffer.global_state[0] = np.array(self.env.get_state(), dtype=np.float32)
         self.buffer.available_actions[0] = np.array(self.env.get_avail_actions(), dtype=np.float32)
-
-    # ===========================
-    # ROLLOUT
-    # ===========================
 
     def collect_rollouts(self):
 
@@ -199,11 +186,16 @@ class LightMAPPORunner:
 
             actions = np.array(actions)
 
-            # ✅ HARD MASK SAFETY
+            # 🔥 CRITICAL FIX: refresh avail_actions BEFORE masking
+            current_avail_actions = np.array(self.env.get_avail_actions())
+
             for i in range(len(actions)):
-                if avail_actions[i][actions[i]] == 0:
-                    valid = np.where(avail_actions[i] == 1)[0]
-                    actions[i] = np.random.choice(valid)
+                valid_actions = np.where(current_avail_actions[i] == 1)[0]
+
+                if len(valid_actions) == 0:
+                    actions[i] = 0
+                elif actions[i] not in valid_actions:
+                    actions[i] = np.random.choice(valid_actions)
 
             try:
                 reward, dones, infos = self.env.step(actions)
@@ -255,10 +247,6 @@ class LightMAPPORunner:
 
         return self.args.n_steps
 
-    # ===========================
-    # RETURNS
-    # ===========================
-
     def compute_returns(self):
 
         next_value = self.agent.get_values(
@@ -272,10 +260,6 @@ class LightMAPPORunner:
             self.args.gamma,
             self.args.gae_lambda
         )
-
-    # ===========================
-    # EVALUATION (NEW)
-    # ===========================
 
     def evaluate(self, num_episodes=10):
 
@@ -297,6 +281,15 @@ class LightMAPPORunner:
                 avail_actions = np.array(self.evaluate_env.get_avail_actions())
 
                 actions, _ = self.agent.get_actions(obs, avail_actions, True)
+                actions = np.array(actions)
+
+                # 🔥 also fix eval masking
+                for i in range(len(actions)):
+                    valid_actions = np.where(avail_actions[i] == 1)[0]
+                    if len(valid_actions) == 0:
+                        actions[i] = 0
+                    elif actions[i] not in valid_actions:
+                        actions[i] = np.random.choice(valid_actions)
 
                 reward, dones, infos = self.evaluate_env.step(actions)
 
