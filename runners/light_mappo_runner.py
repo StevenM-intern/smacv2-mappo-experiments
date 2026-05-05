@@ -79,7 +79,6 @@ class LightMAPPORunner:
             self.agent.critic_optimizer.load_state_dict(checkpoint["optimizer_critic"])
 
             self.total_steps = checkpoint.get("step", 0)
-
             print(f"🔁 Loaded checkpoint @ {self.total_steps}")
 
     def safe_reset_env(self, is_eval=False):
@@ -89,26 +88,20 @@ class LightMAPPORunner:
             else:
                 self.env.reset()
         except Exception as e:
-            print("⚠️ RESET FAILED → cleaning temp + restarting:", e)
+            print("⚠️ RESET FAILED:", repr(e))
 
             self.clean_sc2_temp()
 
             try:
-                if is_eval:
-                    self.evaluate_env.close()
-                else:
-                    self.env.close()
+                self.env.close()
+                self.evaluate_env.close()
             except:
                 pass
 
             time.sleep(3)
 
-            if is_eval:
-                self.evaluate_env = create_env(self.args, is_eval=True)
-                self.evaluate_env.reset()
-            else:
-                self.env = create_env(self.args, is_eval=False)
-                self.env.reset()
+            self.env = create_env(self.args, is_eval=False)
+            self.evaluate_env = create_env(self.args, is_eval=True)
 
     def run(self):
 
@@ -138,23 +131,14 @@ class LightMAPPORunner:
                 if self.total_steps % 200000 < steps:
                     self.save_checkpoint()
 
-                if self.total_steps % 2000000 < steps:
-                    print("🔄 FULL ENV RESTART")
-                    self.clean_sc2_temp()
-                    self.env.close()
-                    self.evaluate_env.close()
-                    time.sleep(3)
-                    self.env = create_env(self.args, is_eval=False)
-                    self.evaluate_env = create_env(self.args, is_eval=True)
-
             except Exception as e:
                 crash_count += 1
-                print(f"💥 CRASH {crash_count}:", e)
+                print(f"💥 CRASH {crash_count}:", repr(e))
 
                 self.save_checkpoint()
 
                 if crash_count > 5:
-                    print("❌ TOO MANY CRASHES → FULL RESET")
+                    print("❌ TOO MANY CRASHES → RESET")
                     self.clean_sc2_temp()
                     self.env.close()
                     self.evaluate_env.close()
@@ -184,9 +168,8 @@ class LightMAPPORunner:
             actions, action_log_probs = self.agent.get_actions(obs, avail_actions, False)
             values = self.agent.get_values(state, obs, active_masks)
 
-            actions = np.array(actions)
+            actions = np.array(actions).astype(np.int32).reshape(self.args.n_agents)
 
-            # 🔥 CRITICAL FIX: refresh avail_actions BEFORE masking
             current_avail_actions = np.array(self.env.get_avail_actions())
 
             for i in range(len(actions)):
@@ -200,7 +183,7 @@ class LightMAPPORunner:
             try:
                 reward, dones, infos = self.env.step(actions)
             except Exception as e:
-                print("⚠️ TRAIN CRASH:", e)
+                print("⚠️ STEP ERROR:", repr(e))
                 self.safe_reset_env()
                 continue
 
@@ -212,7 +195,15 @@ class LightMAPPORunner:
             if done:
                 self.episodes += 1
 
-                win = 1 if infos.get("battle_won", False) else 0
+                # 🔥 FIXED INFO HANDLING
+                if isinstance(infos, dict):
+                    win_flag = infos.get("battle_won", False)
+                elif isinstance(infos, list) and len(infos) > 0:
+                    win_flag = infos[0].get("battle_won", False)
+                else:
+                    win_flag = False
+
+                win = 1 if win_flag else 0
 
                 wandb.log({
                     "train/win_rate": win,
@@ -263,9 +254,7 @@ class LightMAPPORunner:
 
     def evaluate(self, num_episodes=10):
 
-        rewards = []
-        lengths = []
-        wins = []
+        rewards, lengths, wins = [], [], []
 
         for _ in range(num_episodes):
 
@@ -281,9 +270,8 @@ class LightMAPPORunner:
                 avail_actions = np.array(self.evaluate_env.get_avail_actions())
 
                 actions, _ = self.agent.get_actions(obs, avail_actions, True)
-                actions = np.array(actions)
+                actions = np.array(actions).astype(np.int32).reshape(self.args.n_agents)
 
-                # 🔥 also fix eval masking
                 for i in range(len(actions)):
                     valid_actions = np.where(avail_actions[i] == 1)[0]
                     if len(valid_actions) == 0:
@@ -297,20 +285,19 @@ class LightMAPPORunner:
                 episode_length += 1
                 done = np.all(dones)
 
-            win = 1 if infos.get("battle_won", False) else 0
+            if isinstance(infos, dict):
+                win_flag = infos.get("battle_won", False)
+            elif isinstance(infos, list) and len(infos) > 0:
+                win_flag = infos[0].get("battle_won", False)
+            else:
+                win_flag = False
 
+            wins.append(1 if win_flag else 0)
             rewards.append(episode_reward)
             lengths.append(episode_length)
-            wins.append(win)
 
         wandb.log({
             "eval/reward": np.mean(rewards),
             "eval/win_rate": np.mean(wins),
             "eval/length": np.mean(lengths),
         }, step=self.total_steps)
-
-        print(
-            f"{self.total_steps}/{self.args.max_steps} Eval → "
-            f"Reward: {np.mean(rewards):.2f}, "
-            f"Win: {np.mean(wins):.2f}"
-        )
